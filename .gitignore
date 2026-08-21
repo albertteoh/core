@@ -145,3 +145,8 @@ pytest_buckets.txt
 .claude/worktrees/
 .serena/
 
+# Playwright e2e tests
+tests/e2e/node_modules/
+tests/e2e/playwright-report/
+tests/e2e/test-results/
+homeassistant/components/growatt_server/_build_info.py

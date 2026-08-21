@@ -987,11 +987,10 @@ def hass_ws_client(
             data["id"] = next(id_generator)
             return websocket.send_json(data)
 
-        async def _remove_device(device_id: str, config_entry_id: str) -> Any:
+        async def _remove_device(device_id: str) -> Any:
             await _send_json_auto_id(
                 {
-                    "type": "config/device_registry/remove_config_entry",
-                    "config_entry_id": config_entry_id,
+                    "type": "config/device_registry/remove",
                     "device_id": device_id,
                 }
             )
@@ -2014,7 +2013,6 @@ def mock_bleak_scanner_start() -> Generator[MagicMock]:
     # We need to drop the stop method from the object since we patched
     # out start and this fixture will expire before the stop method is called
     # when EVENT_HOMEASSISTANT_STOP is fired.
-    # pylint: disable-next=c-extension-no-member
     bluetooth_scanner.OriginalBleakScanner.stop = AsyncMock()  # type: ignore[assignment]
 
     # Mock BlueZ management controller to successfully setup
@@ -2024,7 +2022,7 @@ def mock_bleak_scanner_start() -> Generator[MagicMock]:
 
     with (
         patch.object(
-            bluetooth_scanner.OriginalBleakScanner,  # pylint: disable=c-extension-no-member
+            bluetooth_scanner.OriginalBleakScanner,
             "start",
         ) as mock_bleak_scanner_start,
         patch.object(bluetooth_scanner, "HaScanner"),
@@ -2254,8 +2252,11 @@ DhcpServiceInfo.__init__ = _dhcp_service_info_init
 def disable_http_server() -> Generator[None]:
     """Disable automatic start of HTTP server during tests.
 
-    This prevents the HTTP server from starting in tests that setup
-    integrations which depend on the HTTP component.
+    This prevents the HTTP server from binding sockets and starting in tests
+    that setup integrations which depend on the HTTP component.
     """
-    with patch("homeassistant.components.http.HomeAssistantHTTP.start"):
+    with (
+        patch("homeassistant.components.http.HomeAssistantHTTP.async_bind"),
+        patch("homeassistant.components.http.HomeAssistantHTTP.start"),
+    ):
         yield
