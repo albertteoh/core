@@ -421,25 +421,58 @@ async def test_classic_api_login_exceptions(
 
 
 @pytest.mark.parametrize(
-    "login_response",
+    ("login_response", "expected_state"),
     [
-        {"success": False, "msg": "502"},
-        {"success": False, "msg": "Server maintenance"},
+        ({"success": False, "msg": "502"}, ConfigEntryState.SETUP_ERROR),
+        ({"success": False, "msg": "Server maintenance"}, ConfigEntryState.SETUP_ERROR),
+        ({"success": False, "msg": "507"}, ConfigEntryState.SETUP_RETRY),
     ],
-    ids=["invalid_auth", "other_login_error"],
+    ids=["invalid_auth", "other_login_error", "rate_limited"],
 )
 async def test_classic_api_login_failures(
     hass: HomeAssistant,
     mock_growatt_classic_api,
     mock_config_entry_classic: MockConfigEntry,
     login_response: dict,
+    expected_state: ConfigEntryState,
 ) -> None:
-    """Test Classic API setup with login failures."""
+    """Test Classic API setup with login failures.
+
+    A 507 lands in SETUP_RETRY, not SETUP_ERROR, unlike the other cases —
+    HA auto-retries a SETUP_RETRY entry, which is what we want for a
+    transient rate limit rather than a fatal error requiring user action.
+    """
     mock_growatt_classic_api.login.return_value = login_response
 
     await setup_integration(hass, mock_config_entry_classic)
 
-    assert mock_config_entry_classic.state is ConfigEntryState.SETUP_ERROR
+    assert mock_config_entry_classic.state is expected_state
+
+
+async def test_classic_api_login_rate_limit_backoff_blocks_retry(
+    hass: HomeAssistant,
+    mock_growatt_classic_api,
+    mock_config_entry_classic: MockConfigEntry,
+) -> None:
+    """Test that a 507 blocks the next login attempt until backoff elapses.
+
+    HA's own SETUP_RETRY schedule shouldn't be able to hammer Growatt's
+    login endpoint again within seconds — a real 507 has been observed to
+    come with a 24-hour account lockout.
+    """
+    mock_growatt_classic_api.login.return_value = {"success": False, "msg": "507"}
+
+    await setup_integration(hass, mock_config_entry_classic)
+    assert mock_config_entry_classic.state is ConfigEntryState.SETUP_RETRY
+    assert mock_growatt_classic_api.login.call_count == 1
+
+    # Simulate HA's own retry firing again immediately — the backoff gate
+    # should refuse the network call rather than hitting Growatt again.
+    await hass.config_entries.async_reload(mock_config_entry_classic.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry_classic.state is ConfigEntryState.SETUP_RETRY
+    assert mock_growatt_classic_api.login.call_count == 1
 
 
 @pytest.mark.parametrize(

@@ -41,6 +41,15 @@ PLATFORMS = [Platform.NUMBER, Platform.SENSOR, Platform.SWITCH]
 
 # Growatt Classic API error codes
 LOGIN_INVALID_AUTH_CODE = "502"
+LOGIN_RATE_LIMITED_CODE = "507"
+
+# Custom backoff for classic-API login rate limiting. A 507 has been observed
+# to come with a 24h account lockout (confirmed via the ShinePhone app during
+# one), which is far longer than HA's built-in SETUP_RETRY backoff (caps at
+# 10 minutes, retries forever) — using that directly would mean ~144 more
+# login attempts against an account already locked out for the day.
+LOGIN_RATE_LIMIT_BACKOFF_BASE = 600  # 10 minutes
+LOGIN_RATE_LIMIT_BACKOFF_MAX = 86400  # 24 hours
 
 
 # Config flow error types (also used as abort reasons)
