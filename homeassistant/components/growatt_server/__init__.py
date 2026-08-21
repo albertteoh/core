@@ -28,6 +28,7 @@ from collections.abc import Mapping
 import datetime
 from json import JSONDecodeError
 import logging
+import time
 
 import growattServer
 from growattServer import GrowattV1ApiErrorCode
@@ -56,6 +57,9 @@ from .const import (
     DEVICE_SCAN_INTERVAL,
     DOMAIN,
     LOGIN_INVALID_AUTH_CODE,
+    LOGIN_RATE_LIMIT_BACKOFF_BASE,
+    LOGIN_RATE_LIMIT_BACKOFF_MAX,
+    LOGIN_RATE_LIMITED_CODE,
     PLATFORMS,
     SUPPORTED_DEVICE_TYPES,
     V1_DEVICE_TYPES,
@@ -82,6 +86,32 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 # to async_setup_entry. Avoids a second login() during the same startup, which
 # would hit Growatt's 5-minute per-endpoint rate limit. Popped after first use.
 _CACHED_APIS: dict[str, growattServer.GrowattApi] = {}
+
+# Per-entry classic-API login backoff after a 507. In-memory only — an HA
+# restart mid-lockout resets it to LOGIN_RATE_LIMIT_BACKOFF_BASE rather than
+# wherever it had climbed to, which is still far gentler than retrying every
+# 10 minutes for a full day. Keyed by entry_id: (attempt count, monotonic
+# timestamp of the next allowed login attempt).
+_login_rate_limit_state: dict[str, tuple[int, float]] = {}
+
+
+def _seconds_until_login_retry(entry_id: str) -> float:
+    """Return seconds left in an active login backoff for this entry, or 0."""
+    state = _login_rate_limit_state.get(entry_id)
+    if state is None:
+        return 0
+    _, next_attempt_at = state
+    return max(0.0, next_attempt_at - time.monotonic())
+
+
+def _record_login_rate_limit(entry_id: str) -> float:
+    """Record a 507 and return the delay before the next attempt is allowed."""
+    attempt, _ = _login_rate_limit_state.get(entry_id, (0, 0.0))
+    delay = min(
+        LOGIN_RATE_LIMIT_BACKOFF_BASE * 2**attempt, LOGIN_RATE_LIMIT_BACKOFF_MAX
+    )
+    _login_rate_limit_state[entry_id] = (attempt + 1, time.monotonic() + delay)
+    return delay
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -182,14 +212,19 @@ async def async_migrate_entry(
                 try:
                     # Create API instance and login
                     api, login_response = await _create_api_and_login(
-                        hass, username, password, url
+                        hass, username, password, url, config_entry.entry_id
                     )
 
                     # Resolve DEFAULT_PLANT_ID to actual plant_id
                     plant_info = await hass.async_add_executor_job(
                         api.plant_list, login_response["user"]["id"]
                     )
-                except (ConfigEntryError, RequestException, JSONDecodeError) as ex:
+                except (
+                    ConfigEntryError,
+                    ConfigEntryNotReady,
+                    RequestException,
+                    JSONDecodeError,
+                ) as ex:
                     # API failure during migration - return False to retry later
                     _LOGGER.error(
                         "Failed to resolve plant_id during migration: %s. "
@@ -231,7 +266,7 @@ async def async_migrate_entry(
 
 
 async def _create_api_and_login(
-    hass: HomeAssistant, username: str, password: str, url: str
+    hass: HomeAssistant, username: str, password: str, url: str, entry_id: str
 ) -> tuple[growattServer.GrowattApi, dict]:
     """Create API instance and perform login.
 
@@ -243,16 +278,26 @@ async def _create_api_and_login(
     api.server_url = url
 
     login_response = await hass.async_add_executor_job(
-        _login_classic_api, api, username, password
+        _login_classic_api, api, username, password, entry_id
     )
 
     return api, login_response
 
 
 def _login_classic_api(
-    api: growattServer.GrowattApi, username: str, password: str
+    api: growattServer.GrowattApi, username: str, password: str, entry_id: str
 ) -> dict:
     """Log in to Classic API and return user info."""
+    remaining = _seconds_until_login_retry(entry_id)
+    if remaining:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="rate_limited",
+            translation_placeholders={
+                "error": f"still in backoff, {int(remaining)}s left"
+            },
+        )
+
     try:
         login_response = api.login(username, password)
     except (RequestException, JSONDecodeError) as ex:
@@ -270,12 +315,20 @@ def _login_classic_api(
                 translation_domain=DOMAIN,
                 translation_key="invalid_credentials",
             )
+        if msg == LOGIN_RATE_LIMITED_CODE:
+            delay = _record_login_rate_limit(entry_id)
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN,
+                translation_key="rate_limited",
+                translation_placeholders={"error": f"next attempt in {int(delay)}s"},
+            )
         raise ConfigEntryError(
             translation_domain=DOMAIN,
             translation_key="login_failed",
             translation_placeholders={"message": msg},
         )
 
+    _login_rate_limit_state.pop(entry_id, None)
     return login_response
 
 
@@ -374,7 +427,9 @@ async def async_setup_entry(
         else:
             # No cached API (normal setup or migration didn't run)
             # Create new API instance and login
-            api, _ = await _create_api_and_login(hass, username, password, url)
+            api, _ = await _create_api_and_login(
+                hass, username, password, url, config_entry.entry_id
+            )
 
         # Get plant_id and devices using the authenticated session
         plant_id = config[CONF_PLANT_ID]
