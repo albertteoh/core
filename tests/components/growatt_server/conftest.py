@@ -3,6 +3,7 @@
 from unittest.mock import Mock, patch
 
 import pytest
+from pytest_homeassistant.common import MockConfigEntry
 
 from homeassistant.components.growatt_server.const import (
     AUTH_API_TOKEN,
@@ -16,8 +17,6 @@ from homeassistant.components.growatt_server.const import (
 from homeassistant.const import CONF_PASSWORD, CONF_TOKEN, CONF_URL, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 
-from tests.common import MockConfigEntry
-
 
 @pytest.fixture
 def mock_growatt_v1_api():
@@ -29,6 +28,7 @@ def mock_growatt_v1_api():
     Methods mocked for integration setup:
     - device_list: Called during async_setup_entry to discover devices
     - plant_energy_overview: Called by total coordinator during first refresh
+    - plant_power_overview: Called for the total coordinator's current power
 
     Methods mocked for MIN device coordinator refresh:
     - min_detail: Provides device state (e.g., acChargeEnable, chargePowerCommand)
@@ -144,6 +144,10 @@ def mock_growatt_v1_api():
             "today_energy": 12.5,
             "total_energy": 1250.0,
             "current_power": 2.5,
+        }
+        mock_v1_api.plant_power_overview.return_value = {
+            "count": 0,
+            "powers": [],
         }
 
         # Called by switch/number entities during turn_on/turn_off/set_value
@@ -350,10 +354,53 @@ def mock_growatt_classic_api():
             "chartData": {"06:00": {}},  # At least one time entry needed
         }
 
+        # Called on demand by read_ac_charge_times/read_ac_discharge_times for
+        # classic auth (getMixSetParams) - NOT part of the regular mix_detail poll.
+        # Shape verified against a real Mix inverter's response.
+        mock_classic_api.get_mix_inverter_settings.return_value = {
+            "obj": {
+                "mixBean": {
+                    "chargePowerCommand": "100",
+                    "wchargeSOCLowLimit1": "90",
+                    "wchargeSOCLowLimit2": "100",
+                    "acChargeEnable": "1",
+                    "forcedChargeTimeStart1": "1:0",
+                    "forcedChargeTimeStop1": "5:0",
+                    "forcedChargeStopSwitch1": "1",
+                    "forcedChargeTimeStart2": "0:0",
+                    "forcedChargeTimeStop2": "0:0",
+                    "forcedChargeStopSwitch2": "0",
+                    "forcedChargeTimeStart3": "0:0",
+                    "forcedChargeTimeStop3": "0:0",
+                    "forcedChargeStopSwitch3": "0",
+                    "disChargePowerCommand": "100",
+                    "wdisChargeSOCLowLimit1": "10",
+                    "wdisChargeSOCLowLimit2": "50",
+                    "offGridDischargeSOC": "20",
+                    "forcedDischargeTimeStart1": "10:0",
+                    "forcedDischargeTimeStop1": "16:0",
+                    "forcedDischargeStopSwitch1": "1",
+                    "forcedDischargeTimeStart2": "0:0",
+                    "forcedDischargeTimeStop2": "0:0",
+                    "forcedDischargeStopSwitch2": "0",
+                    "forcedDischargeTimeStart3": "0:0",
+                    "forcedDischargeTimeStop3": "0:0",
+                    "forcedDischargeStopSwitch3": "0",
+                }
+            }
+        }
+
         mock_classic_api.tlx_detail.return_value = {
             "data": {
                 "deviceSn": "TLX123456",
             }
+        }
+
+        # Called by write_ac_charge_times / write_ac_discharge_times services
+        # for Classic (username/password) auth on Mix devices
+        mock_classic_api.update_mix_inverter_setting.return_value = {
+            "success": True,
+            "msg": "200",
         }
 
         yield mock_classic_api
@@ -451,6 +498,6 @@ def mock_setup_entry():
     """Mock async_setup_entry to prevent actual setup during config flow tests."""
     with patch(
         "homeassistant.components.growatt_server.async_setup_entry",
-        return_value=True,
+        return_value=None,
     ) as mock:
         yield mock
