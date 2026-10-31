@@ -8,11 +8,11 @@ from typing import TYPE_CHECKING, Any, override
 
 import growattServer
 from growattServer import GrowattV1ApiErrorCode
-from requests import RequestException
+from requests import JSONDecodeError as RequestsJSONDecodeError, RequestException
 
 from homeassistant.components.sensor import SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_PASSWORD, CONF_URL, CONF_USERNAME
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
@@ -26,7 +26,6 @@ from .const import (
     BATT_MODE_BATTERY_FIRST,
     BATT_MODE_GRID_FIRST,
     BATT_MODE_LOAD_FIRST,
-    DEFAULT_URL,
     DOMAIN,
     LOGIN_INVALID_AUTH_CODE,
     V1_DEVICE_TYPES,
@@ -89,6 +88,7 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         device_id: str,
         device_type: str,
         plant_id: str,
+        api: growattServer.GrowattApi,
     ) -> None:
         """Initialize the coordinator."""
         self.api_version = (
@@ -100,8 +100,7 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.previous_values: dict[str, Any] = {}
         self._pre_reset_values: dict[str, float] = {}
         # Populated during _sync_update_data when request_device_list_scan() was called.
-        # Consumed by _async_scan_for_new_devices to avoid a separate executor job
-        # and the extra login() call that would otherwise be required (Classic API).
+        # Consumed by _async_scan_for_new_devices to avoid a separate executor job.
         # Thread safety: written in the executor thread, read on the event loop after
         # async_refresh() awaits the executor job — ordering guarantees safe access.
         self.device_list: list[dict[str, str]] | None = None
@@ -112,24 +111,12 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # api is an OpenApiV1 (v1) or its base class GrowattApi (classic), chosen
         # by api_version. The two expose different method sets, and mypy cannot
         # narrow self.api by api_version at each call site, so it is typed as Any.
-        self.api: Any
-        if self.api_version == "v1":
-            self.username = None
-            self.password = None
-            self.url = config_entry.data.get(CONF_URL, DEFAULT_URL)
-            self.token = config_entry.data["token"]
-            self.api = growattServer.OpenApiV1(token=self.token)
-            self.api.server_url = self.url
-        elif self.api_version == "classic":
+        # The instance is shared by all coordinators of the entry, so on classic
+        # they share one logged-in session.
+        self.api: Any = api
+        if self.api_version == "classic":
             self.username = config_entry.data.get(CONF_USERNAME)
             self.password = config_entry.data[CONF_PASSWORD]
-            self.url = config_entry.data.get(CONF_URL, DEFAULT_URL)
-            self.api = growattServer.GrowattApi(
-                add_random_user_id=True, agent_identifier=self.username
-            )
-            self.api.server_url = self.url
-        else:
-            raise ValueError(f"Unknown API version: {self.api_version}")
 
         super().__init__(
             hass,
@@ -164,7 +151,6 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.device_list = None
         else:
             try:
-                # login() was already called above; reuse the same session.
                 devices = self.api.device_list(self.plant_id)
                 self.device_list = [
                     {
@@ -184,30 +170,46 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 self.device_list = None
 
+    def _sync_login(self) -> None:
+        """Log in to the Classic API, replacing the shared session."""
+        login_response = self.api.login(self.username, self.password)
+        if not login_response.get("success"):
+            msg = login_response.get("msg", "Unknown error")
+            if msg == LOGIN_INVALID_AUTH_CODE:
+                raise ConfigEntryAuthFailed(
+                    translation_domain=DOMAIN,
+                    translation_key="invalid_credentials",
+                )
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="login_failed",
+                translation_placeholders={"message": msg},
+            )
+
     def _sync_update_data(self) -> dict[str, Any]:
         """Update data via library synchronously."""
-        _LOGGER.debug("Updating data for %s (%s)", self.device_id, self.device_type)
-
         # Consume the scan flag immediately so it is cleared even if an exception
         # is raised later in this method.
         fetch_device_list = self._fetch_device_list
         self._fetch_device_list = False
 
-        # login only required for classic API
-        if self.api_version == "classic":
-            login_response = self.api.login(self.username, self.password)
-            if not login_response.get("success"):
-                msg = login_response.get("msg", "Unknown error")
-                if msg == LOGIN_INVALID_AUTH_CODE:
-                    raise ConfigEntryAuthFailed(
-                        translation_domain=DOMAIN,
-                        translation_key="invalid_credentials",
-                    )
-                raise UpdateFailed(
-                    translation_domain=DOMAIN,
-                    translation_key="login_failed",
-                    translation_placeholders={"message": msg},
-                )
+        if self.api_version == "v1":
+            return self._sync_fetch_data(fetch_device_list)
+
+        # Classic logins are limited per day (error 507), so the session set up
+        # in async_setup_entry is reused until it expires. Growatt answers an
+        # expired session with a redirect to an HTML login page, which the
+        # library surfaces as a JSONDecodeError.
+        try:
+            return self._sync_fetch_data(fetch_device_list)
+        except RequestsJSONDecodeError:
+            _LOGGER.debug("Growatt session expired, logging in again")
+        self._sync_login()
+        return self._sync_fetch_data(fetch_device_list)
+
+    def _sync_fetch_data(self, fetch_device_list: bool) -> dict[str, Any]:
+        """Fetch data for this coordinator's device."""
+        _LOGGER.debug("Updating data for %s (%s)", self.device_id, self.device_type)
 
         if self.device_type == "total":
             if self.api_version == "v1":
@@ -396,7 +398,7 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Asynchronously update data via library."""
         try:
             return await self.hass.async_add_executor_job(self._sync_update_data)
-        except json.decoder.JSONDecodeError as err:
+        except (json.decoder.JSONDecodeError, RequestsJSONDecodeError) as err:
             raise UpdateFailed(
                 translation_domain=DOMAIN,
                 translation_key="fetch_data_failed",
@@ -407,8 +409,8 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Request that the next _sync_update_data also fetches the device list.
 
         Setting this flag before async_refresh() keeps the device_list call in
-        the same executor thread as the existing login() + plant-overview fetch,
-        so no extra login is needed and there is no thread-safety concern.
+        the same executor job as the plant-overview fetch, so it runs on the
+        same session with no extra executor job.
         """
         self._fetch_device_list = True
 

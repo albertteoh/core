@@ -6,7 +6,8 @@ Classic API (username/password):
 - Authenticates via api.login(), which returns a dict with a "success" key.
 - Auth failure is signalled by success=False and msg="502" (LOGIN_INVALID_AUTH_CODE).
 - A failed login does NOT raise an exception — the return value must be checked.
-- The coordinator calls api.login() on every update cycle to maintain the session.
+- Setup logs in once and all coordinators share that session. A coordinator
+  logs in again only when a request comes back unauthenticated.
 
 Open API V1 (API token):
 - Stateless — no login call, token is sent as a Bearer header on every request.
@@ -375,13 +376,18 @@ async def async_setup_entry(
 
     # Create a coordinator for the total sensors
     total_coordinator = GrowattCoordinator(
-        hass, config_entry, plant_id, "total", plant_id
+        hass, config_entry, plant_id, "total", plant_id, api
     )
 
     # Create coordinators for each device
     device_coordinators = {
         device["deviceSn"]: GrowattCoordinator(
-            hass, config_entry, device["deviceSn"], device["deviceType"], plant_id
+            hass,
+            config_entry,
+            device["deviceSn"],
+            device["deviceType"],
+            plant_id,
+            api,
         )
         for device in devices
         if device["deviceType"] in SUPPORTED_DEVICE_TYPES
@@ -410,10 +416,8 @@ async def async_setup_entry(
 
         total_coordinator = config_entry.runtime_data.total_coordinator
         # Signal the coordinator to also fetch the device list on its next
-        # _sync_update_data run, then force an immediate refresh.  This keeps
-        # the device_list call in the same executor thread as the existing
-        # login() + plant-overview call, so for Classic API there is no extra
-        # login and no thread-safety concern with the shared session.
+        # _sync_update_data run, then force an immediate refresh, so the
+        # device_list call runs in the same executor job as the plant overview.
         total_coordinator.request_device_list_scan()
         await total_coordinator.async_refresh()
 
@@ -467,7 +471,7 @@ async def async_setup_entry(
                 )
                 continue
             coordinator = GrowattCoordinator(
-                hass, config_entry, device_sn, device_type, current_plant_id
+                hass, config_entry, device_sn, device_type, current_plant_id, api
             )
             await coordinator.async_refresh()
             if not coordinator.last_update_success:
