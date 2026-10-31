@@ -650,6 +650,9 @@
     "login_failed": {
       "message": "Growatt login failed: {message}"
     },
+    "login_rate_limited": {
+      "message": "Growatt has temporarily blocked logins for this account after too many attempts (error 507). Logging in again later."
+    },
     "migration_invalid_plant_id": {
       "message": "The configuration contains an invalid plant ID, reconfigure the integration"
     },

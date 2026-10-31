@@ -61,7 +61,12 @@ from .const import (
     SUPPORTED_DEVICE_TYPES,
     V1_DEVICE_TYPES,
 )
-from .coordinator import GrowattConfigEntry, GrowattCoordinator
+from .coordinator import (
+    GrowattClassicSession,
+    GrowattConfigEntry,
+    GrowattCoordinator,
+    GrowattLoginRateLimited,
+)
 from .models import GrowattRuntimeData
 from .services import async_setup_services
 
@@ -164,13 +169,13 @@ async def async_migrate_entry(
 
                 try:
                     # Create API instance and login
-                    api, login_response = await _create_api_and_login(
+                    session, login_response = await _create_api_and_login(
                         hass, username, password, url
                     )
 
                     # Resolve DEFAULT_PLANT_ID to actual plant_id
                     plant_info = await hass.async_add_executor_job(
-                        api.plant_list, login_response["user"]["id"]
+                        session.api.plant_list, login_response["user"]["id"]
                     )
                 except (ConfigEntryError, RequestException, JSONDecodeError) as ex:
                     raise ConfigEntryNotReady(
@@ -198,7 +203,7 @@ async def async_migrate_entry(
                 )
 
                 # Cache the logged-in API instance for reuse in async_setup_entry()
-                _CACHED_APIS[config_entry.entry_id] = api
+                _CACHED_APIS[config_entry.entry_id] = session.api
 
                 _LOGGER.info(
                     "Migrated config entry to use specific plant_id '%s'",
@@ -213,34 +218,37 @@ async def async_migrate_entry(
 
 async def _create_api_and_login(
     hass: HomeAssistant, username: str, password: str, url: str
-) -> tuple[growattServer.GrowattApi, dict]:
+) -> tuple[GrowattClassicSession, dict]:
     """Create API instance and perform login.
 
-    Returns both the API instance (with authenticated session) and the login
+    Returns both the session (with the authenticated API instance) and the login
     response (containing user_id needed for subsequent API calls).
 
     """
     api = growattServer.GrowattApi(add_random_user_id=True, agent_identifier=username)
     api.server_url = url
+    session = GrowattClassicSession(hass, api, username, password)
 
-    login_response = await hass.async_add_executor_job(
-        _login_classic_api, api, username, password
-    )
+    login_response = await hass.async_add_executor_job(_login_classic_api, session)
 
-    return api, login_response
+    return session, login_response
 
 
-def _login_classic_api(
-    api: growattServer.GrowattApi, username: str, password: str
-) -> dict:
+def _login_classic_api(session: GrowattClassicSession) -> dict:
     """Log in to Classic API and return user info."""
     try:
-        login_response = api.login(username, password)
+        login_response = session.login()
     except (RequestException, JSONDecodeError) as ex:
         raise ConfigEntryError(
             translation_domain=DOMAIN,
             translation_key="communication_error",
             translation_placeholders={"error": str(ex)},
+        ) from ex
+    except GrowattLoginRateLimited as ex:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="login_rate_limited",
+            retry_after=ex.retry_after,
         ) from ex
 
     if not login_response.get("success"):
@@ -331,6 +339,7 @@ async def async_setup_entry(
     # Determine API version and get devices
     # Note: auth_type field is guaranteed to exist after migration
     api: growattServer.GrowattApi
+    classic_session: GrowattClassicSession | None = None
     if config.get(CONF_AUTH_TYPE) == AUTH_API_TOKEN:
         # V1 API (token-based, no login needed)
         token = config[CONF_TOKEN]
@@ -351,12 +360,17 @@ async def async_setup_entry(
 
         if cached_api:
             # Reuse the logged-in API instance from migration (rate limit optimization)
-            api = cached_api
+            classic_session = GrowattClassicSession(
+                hass, cached_api, username, password
+            )
             _LOGGER.debug("Reusing logged-in session from migration")
         else:
             # No cached API (normal setup or migration didn't run)
             # Create new API instance and login
-            api, _ = await _create_api_and_login(hass, username, password, url)
+            classic_session, _ = await _create_api_and_login(
+                hass, username, password, url
+            )
+        api = classic_session.api
 
         # Get plant_id and devices using the authenticated session
         plant_id = config[CONF_PLANT_ID]
@@ -376,7 +390,7 @@ async def async_setup_entry(
 
     # Create a coordinator for the total sensors
     total_coordinator = GrowattCoordinator(
-        hass, config_entry, plant_id, "total", plant_id, api
+        hass, config_entry, plant_id, "total", plant_id, api, classic_session
     )
 
     # Create coordinators for each device
@@ -388,6 +402,7 @@ async def async_setup_entry(
             device["deviceType"],
             plant_id,
             api,
+            classic_session,
         )
         for device in devices
         if device["deviceType"] in SUPPORTED_DEVICE_TYPES
@@ -471,7 +486,13 @@ async def async_setup_entry(
                 )
                 continue
             coordinator = GrowattCoordinator(
-                hass, config_entry, device_sn, device_type, current_plant_id, api
+                hass,
+                config_entry,
+                device_sn,
+                device_type,
+                current_plant_id,
+                api,
+                classic_session,
             )
             await coordinator.async_refresh()
             if not coordinator.last_update_success:

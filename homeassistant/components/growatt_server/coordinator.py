@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import logging
 import math
+import threading
 from typing import TYPE_CHECKING, Any, override
 
 import growattServer
@@ -12,7 +13,6 @@ from requests import JSONDecodeError as RequestsJSONDecodeError, RequestExceptio
 
 from homeassistant.components.sensor import SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
@@ -26,8 +26,10 @@ from .const import (
     BATT_MODE_BATTERY_FIRST,
     BATT_MODE_GRID_FIRST,
     BATT_MODE_LOAD_FIRST,
+    DATA_LOGIN_BLOCKED_UNTIL,
     DOMAIN,
     LOGIN_INVALID_AUTH_CODE,
+    LOGIN_RATE_LIMITED_CODE,
     V1_DEVICE_TYPES,
 )
 from .models import GrowattRuntimeData
@@ -39,8 +41,70 @@ type GrowattConfigEntry = ConfigEntry[GrowattRuntimeData]
 
 SCAN_INTERVAL = dt.timedelta(minutes=5)
 _MAX_POWER_READING_AGE = dt.timedelta(minutes=10)
+# A 507 lockout lasts until about 24 hours after the first login of the run.
+# Logins attempted every 2 hours during a lockout did not delay its end.
+LOGIN_COOLDOWN = dt.timedelta(hours=2)
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class GrowattLoginRateLimited(Exception):
+    """Growatt refused a Classic API login because of too many logins."""
+
+    def __init__(self, retry_after: float) -> None:
+        """Initialize with the seconds until a login may be attempted again."""
+        super().__init__(f"Login blocked for {retry_after:.0f} seconds")
+        self.retry_after = retry_after
+
+
+class GrowattClassicSession:
+    """Classic API client and login state shared by a config entry."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: growattServer.GrowattApi,
+        username: str,
+        password: str,
+    ) -> None:
+        """Initialize the session."""
+        self.api = api
+        self.username = username
+        self.password = password
+        # Incremented on every successful login.
+        self.generation = 0
+        self._lock = threading.RLock()
+        # Shared across reloads, since the lockout belongs to the account.
+        self._blocked_until = hass.data.setdefault(DATA_LOGIN_BLOCKED_UNTIL, {})
+
+    def login(self) -> dict[str, Any]:
+        """Log in and return the login response.
+
+        Raises GrowattLoginRateLimited on a 507, and without logging in while
+        the cooldown after a 507 is running.
+        """
+        with self._lock:
+            now = dt_util.utcnow()
+            if (until := self._blocked_until.get(self.username)) and now < until:
+                raise GrowattLoginRateLimited((until - now).total_seconds())
+            login_response = self.api.login(self.username, self.password)
+            # growattServer releases after 2.2.0 raise GrowattRateLimitError instead.
+            if login_response.get("msg") == LOGIN_RATE_LIMITED_CODE:
+                self._blocked_until[self.username] = now + LOGIN_COOLDOWN
+                raise GrowattLoginRateLimited(LOGIN_COOLDOWN.total_seconds())
+            if login_response.get("success"):
+                self.generation += 1
+            return login_response
+
+    def renew(self, seen_generation: int) -> dict[str, Any] | None:
+        """Log in again, unless the session was renewed since seen_generation.
+
+        Returns None when another coordinator already logged in.
+        """
+        with self._lock:
+            if self.generation != seen_generation:
+                return None
+            return self.login()
 
 
 def _latest_power_value(
@@ -89,6 +153,7 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         device_type: str,
         plant_id: str,
         api: growattServer.GrowattApi,
+        classic_session: GrowattClassicSession | None = None,
     ) -> None:
         """Initialize the coordinator."""
         self.api_version = (
@@ -114,9 +179,7 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # The instance is shared by all coordinators of the entry, so on classic
         # they share one logged-in session.
         self.api: Any = api
-        if self.api_version == "classic":
-            self.username = config_entry.data.get(CONF_USERNAME)
-            self.password = config_entry.data[CONF_PASSWORD]
+        self.classic_session = classic_session
 
         super().__init__(
             hass,
@@ -170,21 +233,31 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 self.device_list = None
 
-    def _sync_login(self) -> None:
-        """Log in to the Classic API, replacing the shared session."""
-        login_response = self.api.login(self.username, self.password)
-        if not login_response.get("success"):
-            msg = login_response.get("msg", "Unknown error")
-            if msg == LOGIN_INVALID_AUTH_CODE:
-                raise ConfigEntryAuthFailed(
-                    translation_domain=DOMAIN,
-                    translation_key="invalid_credentials",
-                )
+    def _sync_renew_session(
+        self, session: GrowattClassicSession, seen_generation: int
+    ) -> None:
+        """Log in to the Classic API again after the session expired."""
+        try:
+            login_response = session.renew(seen_generation)
+        except GrowattLoginRateLimited as err:
             raise UpdateFailed(
                 translation_domain=DOMAIN,
-                translation_key="login_failed",
-                translation_placeholders={"message": msg},
+                translation_key="login_rate_limited",
+                retry_after=err.retry_after,
+            ) from err
+        if login_response is None or login_response.get("success"):
+            return
+        msg = login_response.get("msg", "Unknown error")
+        if msg == LOGIN_INVALID_AUTH_CODE:
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN,
+                translation_key="invalid_credentials",
             )
+        raise UpdateFailed(
+            translation_domain=DOMAIN,
+            translation_key="login_failed",
+            translation_placeholders={"message": msg},
+        )
 
     def _sync_update_data(self) -> dict[str, Any]:
         """Update data via library synchronously."""
@@ -193,18 +266,19 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         fetch_device_list = self._fetch_device_list
         self._fetch_device_list = False
 
-        if self.api_version == "v1":
+        if (session := self.classic_session) is None:
             return self._sync_fetch_data(fetch_device_list)
 
         # Classic logins are limited per day (error 507), so the session set up
         # in async_setup_entry is reused until it expires. Growatt answers an
         # expired session with a redirect to an HTML login page, which the
         # library surfaces as a JSONDecodeError.
+        seen_generation = session.generation
         try:
             return self._sync_fetch_data(fetch_device_list)
         except RequestsJSONDecodeError:
             _LOGGER.debug("Growatt session expired, logging in again")
-        self._sync_login()
+        self._sync_renew_session(session, seen_generation)
         return self._sync_fetch_data(fetch_device_list)
 
     def _sync_fetch_data(self, fetch_device_list: bool) -> dict[str, Any]:

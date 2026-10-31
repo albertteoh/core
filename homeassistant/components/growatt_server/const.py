@@ -1,8 +1,9 @@
 """Define constants for the Growatt Server integration."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from homeassistant.const import Platform
+from homeassistant.util.hass_dict import HassKey
 
 DEVICE_SCAN_INTERVAL = timedelta(hours=1)
 
@@ -41,6 +42,12 @@ PLATFORMS = [Platform.NUMBER, Platform.SENSOR, Platform.SWITCH]
 
 # Growatt Classic API error codes
 LOGIN_INVALID_AUTH_CODE = "502"
+LOGIN_RATE_LIMITED_CODE = "507"
+
+# Classic API login cooldown deadlines, keyed by username
+DATA_LOGIN_BLOCKED_UNTIL: HassKey[dict[str, datetime]] = HassKey(
+    "growatt_server_login_blocked_until"
+)
 
 
 # Config flow error types (also used as abort reasons)

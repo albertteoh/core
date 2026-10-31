@@ -1,7 +1,9 @@
 """Tests for the Growatt Server integration."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 import json
+from unittest.mock import Mock
 
 from freezegun.api import FrozenDateTimeFactory
 import growattServer
@@ -21,6 +23,10 @@ from homeassistant.components.growatt_server.const import (
     DEVICE_SCAN_INTERVAL,
     DOMAIN,
     LOGIN_INVALID_AUTH_CODE,
+)
+from homeassistant.components.growatt_server.coordinator import (
+    LOGIN_COOLDOWN,
+    GrowattClassicSession,
 )
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import (
@@ -350,7 +356,7 @@ async def test_classic_api_expired_session_logs_in_again(
     ("login_response", "tlx_detail_side_effect", "translation_key"),
     [
         pytest.param(
-            {"success": False, "msg": "507"},
+            {"success": False, "msg": "Server maintenance"},
             SESSION_EXPIRED,
             "login_failed",
             id="login_fails",
@@ -395,6 +401,73 @@ async def test_classic_api_expired_session_relogin_failure(
     assert mock_config_entry_classic.state is ConfigEntryState.LOADED
     assert not hass.config_entries.flow.async_progress()
     assert hass.states.get("sensor.tlx123456_output_power").state == STATE_UNAVAILABLE
+
+
+async def test_classic_api_rate_limited_relogin_cooldown(
+    hass: HomeAssistant,
+    mock_growatt_classic_api,
+    mock_config_entry_classic: MockConfigEntry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test a 507 on re-login stops further logins until the cooldown passes."""
+    mock_growatt_classic_api.device_list.return_value = [
+        {"deviceSn": "TLX123456", "deviceType": "tlx"}
+    ]
+    tlx_data = {"data": {"deviceSn": "TLX123456"}}
+    plant_info = mock_growatt_classic_api.plant_info.return_value
+
+    await setup_integration(hass, mock_config_entry_classic)
+    assert mock_config_entry_classic.state is ConfigEntryState.LOADED
+    mock_growatt_classic_api.login.reset_mock()
+
+    mock_growatt_classic_api.plant_info.side_effect = SESSION_EXPIRED
+    mock_growatt_classic_api.tlx_detail.side_effect = SESSION_EXPIRED
+    mock_growatt_classic_api.login.return_value = {"success": False, "msg": "507"}
+
+    for _ in range(3):
+        freezer.tick(timedelta(minutes=5))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    # Only the first coordinator to find the expired session tries to log in.
+    mock_growatt_classic_api.login.assert_called_once()
+    coordinator = mock_config_entry_classic.runtime_data.devices["TLX123456"]
+    assert isinstance(coordinator.last_exception, UpdateFailed)
+    assert coordinator.last_exception.translation_key == "login_rate_limited"
+    assert mock_config_entry_classic.state is ConfigEntryState.LOADED
+    assert hass.states.get("sensor.tlx123456_output_power").state == STATE_UNAVAILABLE
+
+    mock_growatt_classic_api.plant_info.side_effect = [SESSION_EXPIRED, plant_info]
+    mock_growatt_classic_api.tlx_detail.side_effect = None
+    mock_growatt_classic_api.tlx_detail.return_value = tlx_data
+    mock_growatt_classic_api.login.return_value = {
+        "success": True,
+        "user": {"id": 12345},
+    }
+    freezer.tick(LOGIN_COOLDOWN)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert mock_growatt_classic_api.login.call_count == 2
+    assert coordinator.last_update_success
+    assert hass.states.get("sensor.tlx123456_output_power").state != STATE_UNAVAILABLE
+
+
+async def test_classic_session_concurrent_renew_logs_in_once(
+    hass: HomeAssistant,
+) -> None:
+    """Test coordinators renewing the same expired session cause one login."""
+    api = Mock()
+    api.login.return_value = {"success": True}
+    session = GrowattClassicSession(hass, api, "test_user", "test_password")
+    seen_generation = session.generation
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(session.renew, [seen_generation] * 3))
+
+    api.login.assert_called_once_with("test_user", "test_password")
+    assert results.count(None) == 2
+    assert session.generation == seen_generation + 1
 
 
 async def test_classic_api_setup(
@@ -533,25 +606,64 @@ async def test_classic_api_login_exceptions(
 
 
 @pytest.mark.parametrize(
-    "login_response",
+    ("login_response", "expected_state"),
     [
-        {"success": False, "msg": "502"},
-        {"success": False, "msg": "Server maintenance"},
+        pytest.param(
+            {"success": False, "msg": "502"},
+            ConfigEntryState.SETUP_ERROR,
+            id="invalid_auth",
+        ),
+        pytest.param(
+            {"success": False, "msg": "Server maintenance"},
+            ConfigEntryState.SETUP_ERROR,
+            id="other_login_error",
+        ),
+        pytest.param(
+            {"success": False, "msg": "507"},
+            ConfigEntryState.SETUP_RETRY,
+            id="rate_limited",
+        ),
     ],
-    ids=["invalid_auth", "other_login_error"],
 )
 async def test_classic_api_login_failures(
     hass: HomeAssistant,
     mock_growatt_classic_api,
     mock_config_entry_classic: MockConfigEntry,
     login_response: dict,
+    expected_state: ConfigEntryState,
 ) -> None:
     """Test Classic API setup with login failures."""
     mock_growatt_classic_api.login.return_value = login_response
 
     await setup_integration(hass, mock_config_entry_classic)
 
-    assert mock_config_entry_classic.state is ConfigEntryState.SETUP_ERROR
+    assert mock_config_entry_classic.state is expected_state
+
+
+async def test_classic_api_setup_skips_login_during_cooldown(
+    hass: HomeAssistant,
+    mock_growatt_classic_api,
+    mock_config_entry_classic: MockConfigEntry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test setup does not log in again until the 507 cooldown has passed."""
+    mock_growatt_classic_api.login.return_value = {"success": False, "msg": "507"}
+
+    await setup_integration(hass, mock_config_entry_classic)
+    assert mock_config_entry_classic.state is ConfigEntryState.SETUP_RETRY
+
+    await hass.config_entries.async_reload(mock_config_entry_classic.entry_id)
+    assert mock_config_entry_classic.state is ConfigEntryState.SETUP_RETRY
+    mock_growatt_classic_api.login.assert_called_once()
+
+    mock_growatt_classic_api.login.return_value = {
+        "success": True,
+        "user": {"id": 12345},
+    }
+    freezer.tick(LOGIN_COOLDOWN)
+    await hass.config_entries.async_reload(mock_config_entry_classic.entry_id)
+    assert mock_config_entry_classic.state is ConfigEntryState.LOADED
+    assert mock_growatt_classic_api.login.call_count == 2
 
 
 @pytest.mark.parametrize(
