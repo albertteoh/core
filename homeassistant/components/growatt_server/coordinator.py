@@ -88,7 +88,8 @@ class GrowattClassicSession:
             if (until := self._blocked_until.get(self.username)) and now < until:
                 raise GrowattLoginRateLimited((until - now).total_seconds())
             login_response = self.api.login(self.username, self.password)
-            # growattServer releases after 2.2.0 raise GrowattRateLimitError instead.
+            # growattServer releases after 2.2.0 raise GrowattRateLimitError
+            # from any call instead.
             if login_response.get("msg") == LOGIN_RATE_LIMITED_CODE:
                 self._blocked_until[self.username] = now + LOGIN_COOLDOWN
                 raise GrowattLoginRateLimited(LOGIN_COOLDOWN.total_seconds())
@@ -153,7 +154,7 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         device_type: str,
         plant_id: str,
         api: growattServer.GrowattApi,
-        classic_session: GrowattClassicSession | None = None,
+        classic_session: GrowattClassicSession | None,
     ) -> None:
         """Initialize the coordinator."""
         self.api_version = (

@@ -22,6 +22,9 @@ Error handling pattern for reauth:
   → raise ConfigEntryAuthFailed
 - V1 API: catch GrowattV1ApiError with error_code == GrowattV1ApiErrorCode.NO_PRIVILEGE
   → raise ConfigEntryAuthFailed
+- Classic API: msg == LOGIN_RATE_LIMITED_CODE (507, too many logins)
+  → ConfigEntryNotReady (setup) or UpdateFailed (coordinator), both with
+  retry_after so no login is attempted until the cooldown has passed
 - All other errors → ConfigEntryError (setup) or UpdateFailed (coordinator)
 """
 

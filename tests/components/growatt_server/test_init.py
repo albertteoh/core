@@ -1,9 +1,11 @@
 """Tests for the Growatt Server integration."""
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import timedelta
 import json
-from unittest.mock import Mock
+import threading
+from typing import Any
+from unittest.mock import MagicMock, Mock
 
 from freezegun.api import FrozenDateTimeFactory
 import growattServer
@@ -253,7 +255,7 @@ async def test_coordinator_auth_failed_triggers_reauth(
 
 async def test_classic_api_coordinator_auth_failed_triggers_reauth(
     hass: HomeAssistant,
-    mock_growatt_classic_api,
+    mock_growatt_classic_api: MagicMock,
     mock_config_entry_classic: MockConfigEntry,
     freezer: FrozenDateTimeFactory,
 ) -> None:
@@ -297,7 +299,7 @@ async def test_classic_api_coordinator_auth_failed_triggers_reauth(
 
 async def test_classic_api_polls_reuse_session(
     hass: HomeAssistant,
-    mock_growatt_classic_api,
+    mock_growatt_classic_api: MagicMock,
     mock_config_entry_classic: MockConfigEntry,
     freezer: FrozenDateTimeFactory,
 ) -> None:
@@ -322,7 +324,7 @@ async def test_classic_api_polls_reuse_session(
 
 async def test_classic_api_expired_session_logs_in_again(
     hass: HomeAssistant,
-    mock_growatt_classic_api,
+    mock_growatt_classic_api: MagicMock,
     mock_config_entry_classic: MockConfigEntry,
     freezer: FrozenDateTimeFactory,
 ) -> None:
@@ -371,7 +373,7 @@ async def test_classic_api_expired_session_logs_in_again(
 )
 async def test_classic_api_expired_session_relogin_failure(
     hass: HomeAssistant,
-    mock_growatt_classic_api,
+    mock_growatt_classic_api: MagicMock,
     mock_config_entry_classic: MockConfigEntry,
     freezer: FrozenDateTimeFactory,
     login_response: dict,
@@ -405,7 +407,7 @@ async def test_classic_api_expired_session_relogin_failure(
 
 async def test_classic_api_rate_limited_relogin_cooldown(
     hass: HomeAssistant,
-    mock_growatt_classic_api,
+    mock_growatt_classic_api: MagicMock,
     mock_config_entry_classic: MockConfigEntry,
     freezer: FrozenDateTimeFactory,
 ) -> None:
@@ -456,18 +458,32 @@ async def test_classic_api_rate_limited_relogin_cooldown(
 async def test_classic_session_concurrent_renew_logs_in_once(
     hass: HomeAssistant,
 ) -> None:
-    """Test coordinators renewing the same expired session cause one login."""
-    api = Mock()
-    api.login.return_value = {"success": True}
-    session = GrowattClassicSession(hass, api, "test_user", "test_password")
-    seen_generation = session.generation
+    """Test a renew that waits on another coordinator's login does not log in."""
+    entered = threading.Event()
+    release = threading.Event()
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        results = list(pool.map(session.renew, [seen_generation] * 3))
+    def blocking_login(username: str, password: str) -> dict[str, Any]:
+        entered.set()
+        release.wait(5)
+        return {"success": True}
+
+    api = Mock()
+    api.login.side_effect = blocking_login
+    session = GrowattClassicSession(hass, api, "test_user", "test_password")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(session.renew, 0)
+        assert entered.wait(5)
+        second = pool.submit(session.renew, 0)
+        # The second renew must be blocked on the lock while the first logs in.
+        done, _ = wait([second], timeout=0.2)
+        assert not done
+        release.set()
+        assert first.result(5) == {"success": True}
+        assert second.result(5) is None
 
     api.login.assert_called_once_with("test_user", "test_password")
-    assert results.count(None) == 2
-    assert session.generation == seen_generation + 1
+    assert session.generation == 1
 
 
 async def test_classic_api_setup(
@@ -627,7 +643,7 @@ async def test_classic_api_login_exceptions(
 )
 async def test_classic_api_login_failures(
     hass: HomeAssistant,
-    mock_growatt_classic_api,
+    mock_growatt_classic_api: MagicMock,
     mock_config_entry_classic: MockConfigEntry,
     login_response: dict,
     expected_state: ConfigEntryState,
@@ -642,7 +658,7 @@ async def test_classic_api_login_failures(
 
 async def test_classic_api_setup_skips_login_during_cooldown(
     hass: HomeAssistant,
-    mock_growatt_classic_api,
+    mock_growatt_classic_api: MagicMock,
     mock_config_entry_classic: MockConfigEntry,
     freezer: FrozenDateTimeFactory,
 ) -> None:
@@ -966,9 +982,27 @@ async def test_setup_reuses_cached_api_from_migration(
     assert mock_config_entry.entry_id not in _CACHED_APIS
 
 
+@pytest.mark.parametrize(
+    ("login_mock", "reason"),
+    [
+        pytest.param(
+            {"side_effect": requests.exceptions.RequestException("Network error")},
+            "Failed to resolve the plant ID from the Growatt API",
+            id="network_error",
+        ),
+        pytest.param(
+            {"return_value": {"success": False, "msg": "507"}},
+            "Growatt has temporarily blocked logins for this account after too"
+            " many attempts (error 507). Logging in again later",
+            id="rate_limited",
+        ),
+    ],
+)
 async def test_migrate_failure_retries(
     hass: HomeAssistant,
-    mock_growatt_classic_api,
+    mock_growatt_classic_api: MagicMock,
+    login_mock: dict[str, Any],
+    reason: str,
 ) -> None:
     """Test migration is retried on API failure.
 
@@ -992,20 +1026,14 @@ async def test_migrate_failure_retries(
         minor_version=0,
     )
 
-    # Mock API failure (e.g., network error during login)
-    mock_growatt_classic_api.login.side_effect = requests.exceptions.RequestException(
-        "Network error"
-    )
+    mock_growatt_classic_api.login.configure_mock(**login_mock)
 
     mock_config_entry.add_to_hass(hass)
     await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
 
     assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
-    assert (
-        mock_config_entry.reason
-        == "Failed to resolve the plant ID from the Growatt API"
-    )
+    assert mock_config_entry.reason == reason
 
     # Verify version was NOT bumped (remains 1.0)
     assert mock_config_entry.version == 1
