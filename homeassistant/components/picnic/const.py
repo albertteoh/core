@@ -1,11 +1,14 @@
 """Constants for the Picnic integration."""
 
+from datetime import timedelta
+
 DOMAIN = "picnic"
 
 SERVICE_ADD_PRODUCT_TO_CART = "add_product"
 
 ATTR_PRODUCT_ID = "product_id"
 ATTR_PRODUCT_NAME = "product_name"
+ATTR_GTIN = "gtin"
 ATTR_AMOUNT = "amount"
 ATTR_PRODUCT_IDENTIFIERS = "product_identifiers"
 
@@ -17,6 +20,11 @@ CART_DATA = "cart_data"
 SLOT_DATA = "slot_data"
 NEXT_DELIVERY_DATA = "next_delivery_data"
 LAST_ORDER_DATA = "last_order_data"
+
+DEFAULT_UPDATE_INTERVAL = timedelta(minutes=30)
+DELIVERY_UPDATE_INTERVAL = timedelta(minutes=1)
+DELIVERY_WINDOW_LEAD_TIME = timedelta(minutes=30)
+DELIVERY_WINDOW_LAG_TIME = timedelta(hours=2)
 
 SENSOR_CART_ITEMS_COUNT = "cart_items_count"
 SENSOR_CART_TOTAL_PRICE = "cart_total_price"
