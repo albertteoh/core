@@ -3,9 +3,7 @@
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
-      "no_plants": "No plants have been found on this account",
-      "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]",
-      "reconfigure_successful": "[%key:common::config_flow::abort::reconfigure_successful%]"
+      "no_plants": "No plants have been found on this account"
     },
     "error": {
       "cannot_connect": "Cannot connect to Growatt servers. Please check your internet connection and try again.",
@@ -592,6 +590,9 @@
     }
   },
   "exceptions": {
+    "ac_schedule_device_not_configured": {
+      "message": "Device {serial_number} does not support AC charge and discharge actions. These actions require an SPH device with token authentication or a Mix device with username and password authentication."
+    },
     "api_error": {
       "message": "Growatt API error: {error}"
     },
@@ -652,6 +653,39 @@
     "login_failed": {
       "message": "Growatt login failed: {message}"
     },
+    "migration_invalid_plant_id": {
+      "message": "The configuration contains an invalid plant ID, reconfigure the integration"
+    },
+    "migration_missing_credentials": {
+      "message": "The configuration is missing the username or password, reconfigure the integration"
+    },
+    "migration_no_plants": {
+      "message": "No plants found for Growatt account {username}"
+    },
+    "migration_plant_id_failed": {
+      "message": "Failed to resolve the plant ID from the Growatt API"
+    },
+    "mix_settings_empty": {
+      "message": "The Growatt Mix device returned no charge/discharge settings."
+    },
+    "mix_settings_incomplete": {
+      "message": "The Growatt Mix device returned incomplete charge/discharge settings."
+    },
+    "mix_settings_invalid": {
+      "message": "The Growatt Mix device returned invalid charge/discharge settings."
+    },
+    "mix_settings_read_failed": {
+      "message": "Failed to read charge/discharge settings from the Growatt Mix device."
+    },
+    "mix_write_failed": {
+      "message": "Failed to write charge/discharge settings to the Growatt Mix device."
+    },
+    "mix_write_rejected": {
+      "message": "The Growatt Mix device rejected the charge/discharge settings write."
+    },
+    "no_ac_schedule_devices_configured": {
+      "message": "No devices supporting AC charge and discharge actions are configured. These actions require an SPH device with token authentication or a Mix device with username and password authentication."
+    },
     "no_devices_configured": {
       "message": "No {device_type} devices with token authentication are configured. Actions require {device_type} devices with V1 API access."
     },
@@ -686,7 +720,7 @@
   },
   "services": {
     "read_ac_charge_times": {
-      "description": "Reads AC charge time periods from an SPH device.",
+      "description": "Reads AC charge time periods from an SPH/Mix device.",
       "fields": {
         "device_id": {
           "description": "[%key:component::growatt_server::services::read_time_segments::fields::device_id::description%]",
@@ -696,7 +730,7 @@
       "name": "Read AC charge times"
     },
     "read_ac_discharge_times": {
-      "description": "Reads AC discharge time periods from an SPH device.",
+      "description": "Reads AC discharge time periods from an SPH/Mix device.",
       "fields": {
         "device_id": {
           "description": "[%key:component::growatt_server::services::read_time_segments::fields::device_id::description%]",
@@ -746,7 +780,7 @@
       "name": "Update time segment"
     },
     "write_ac_charge_times": {
-      "description": "Writes AC charge time periods to an SPH device.",
+      "description": "Writes AC charge time periods to an SPH/Mix device.",
       "fields": {
         "charge_power": {
           "description": "Charge power limit (%).",
@@ -804,7 +838,7 @@
       "name": "Write AC charge times"
     },
     "write_ac_discharge_times": {
-      "description": "Writes AC discharge time periods to an SPH device.",
+      "description": "Writes AC discharge time periods to an SPH/Mix device.",
       "fields": {
         "device_id": {
           "description": "[%key:component::growatt_server::services::read_time_segments::fields::device_id::description%]",

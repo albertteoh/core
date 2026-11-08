@@ -9,12 +9,14 @@ from homeassistant.components.weather import (
     ATTR_CONDITION_SUNNY,
     ATTR_FORECAST_CONDITION,
     ATTR_FORECAST_HUMIDITY,
+    ATTR_FORECAST_NATIVE_APPARENT_TEMP,
     ATTR_FORECAST_NATIVE_PRECIPITATION,
     ATTR_FORECAST_NATIVE_TEMP,
     ATTR_FORECAST_NATIVE_TEMP_LOW,
     ATTR_FORECAST_NATIVE_WIND_GUST_SPEED,
     ATTR_FORECAST_NATIVE_WIND_SPEED,
     ATTR_FORECAST_TIME,
+    ATTR_FORECAST_UV_INDEX,
     ATTR_FORECAST_WIND_BEARING,
     Forecast,
     WeatherEntity,
@@ -87,6 +89,8 @@ class MeteoFranceWeather(
     """Representation of a weather condition."""
 
     _attr_attribution = ATTRIBUTION
+    _attr_has_entity_name = True
+    _attr_name = None
     _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_native_precipitation_unit = UnitOfPrecipitationDepth.MILLIMETERS
     _attr_native_pressure_unit = UnitOfPressure.HPA
@@ -100,7 +104,6 @@ class MeteoFranceWeather(
     ) -> None:
         """Initialise the platform with a data instance and station name."""
         super().__init__(coordinator)
-        self._attr_name = self.coordinator.data.position["name"]
         self._mode = mode
         pos = self.coordinator.data.position
         self._attr_unique_id = f"{pos['lat']},{pos['lon']}"
@@ -125,7 +128,7 @@ class MeteoFranceWeather(
             identifiers={(DOMAIN, self.platform.config_entry.unique_id)},
             manufacturer=MANUFACTURER,
             model=MODEL,
-            name=self.coordinator.name,
+            name=self.coordinator.data.position["name"],
         )
 
     @property
@@ -144,6 +147,12 @@ class MeteoFranceWeather(
 
     @property
     @override
+    def native_apparent_temperature(self) -> float | None:
+        """Return the apparent temperature."""
+        return self.coordinator.data.current_forecast["T"].get("windchill")
+
+    @property
+    @override
     def native_pressure(self) -> float:
         """Return the pressure."""
         return self.coordinator.data.current_forecast["sea_level"]
@@ -153,6 +162,13 @@ class MeteoFranceWeather(
     def humidity(self) -> float:
         """Return the humidity."""
         return self.coordinator.data.current_forecast["humidity"]
+
+    @property
+    @override
+    def uv_index(self) -> float | None:
+        """Return the UV index."""
+        uv_index = self.coordinator.data.current_forecast.get("uv")
+        return float(uv_index) if uv_index is not None else None
 
     @property
     @override
@@ -195,7 +211,11 @@ class MeteoFranceWeather(
                         ),
                         ATTR_FORECAST_HUMIDITY: forecast["humidity"],
                         ATTR_FORECAST_NATIVE_TEMP: forecast["T"]["value"],
+                        ATTR_FORECAST_NATIVE_APPARENT_TEMP: forecast["T"].get(
+                            "windchill"
+                        ),
                         ATTR_FORECAST_NATIVE_PRECIPITATION: forecast["rain"].get("1h"),
+                        ATTR_FORECAST_UV_INDEX: forecast.get("uv"),
                         ATTR_FORECAST_NATIVE_WIND_SPEED: forecast["wind"]["speed"],
                         ATTR_FORECAST_NATIVE_WIND_GUST_SPEED: forecast["wind"].get(
                             "gust"
